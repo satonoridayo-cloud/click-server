@@ -9,7 +9,7 @@ app = Flask(__name__)
 CORS(app, resources={r"/api/*": {"origins": "*"}})
 
 # ご提示いただいたPostgreSQLの接続URL
-DATABASE_URL = "postgresql://click_7fat_user:NBGd2zod8zoHEiWraPSftUuzP9jDi6K5@dpg-da1e8o3l550s73fg2le0-a/click_7fat"
+DATABASE_URL = "postgresql://click_7fat_user:NBGd2zod8zoHEiWraPSftUuzP9jDi6K5@dpg-da1e8o3l550s73fg2le0-a.virginia-postgres.render.com/click_7fat"
 
 
 def get_db_connection():
