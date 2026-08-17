@@ -6,7 +6,6 @@ import psycopg2
 from psycopg2.extras import RealDictCursor
 
 app = Flask(__name__)
-# フロントエンド（別サイト）からのアクセスを許可
 CORS(app, resources={r"/api/*": {"origins": "*"}})
 
 # ご提示いただいたPostgreSQLの接続URL
@@ -20,7 +19,6 @@ def get_db_connection():
 def init_db():
   conn = get_db_connection()
   cur = conn.cursor()
-  # オンラインマッチング用テーブル
   cur.execute("""
         CREATE TABLE IF NOT EXISTS online (
             id SERIAL PRIMARY KEY,
@@ -29,7 +27,6 @@ def init_db():
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
         );
     """)
-  # 結果・ランキング記録用テーブル
   cur.execute("""
         CREATE TABLE IF NOT EXISTS endpoint (
             id SERIAL PRIMARY KEY,
@@ -66,7 +63,7 @@ def single_result():
   cur.execute(
       """
         INSERT INTO endpoint (player1_name, player1_points, player2_name, player2_points, winner)
-        VALUES (%s, %s, '一人プレイ', 0, %s)
+        VALUES (%s, %s, 'CPU', 0, %s)
     """,
       (username, points, username),
   )
@@ -76,7 +73,7 @@ def single_result():
   return jsonify({"status": "success"})
 
 
-# --- 二人プレイ：マッチング待機・エントリー ---
+# --- 二人プレイ：オンラインテーブルへの追加・ランダムマッチング ---
 @app.route("/api/match/join", methods=["POST"])
 def match_join():
   data = request.json
@@ -85,27 +82,28 @@ def match_join():
   conn = get_db_connection()
   cur = conn.cursor()
 
-  # 自分がすでに登録されているか確認
+  # すでに自分が登録されているか確認
   cur.execute("SELECT * FROM online WHERE username = %s", (username,))
   me = cur.fetchone()
 
   if not me:
+    # 登録されていなければ waiting として追加
     cur.execute(
         "INSERT INTO online (username, status) VALUES (%s, 'waiting')",
         (username,),
     )
     conn.commit()
 
-  # 自分以外の待機中のプレイヤーを探す
+  # 自分以外の waiting 状態のプレイヤーから「ランダム」に1人取得
   cur.execute(
       "SELECT * FROM online WHERE status = 'waiting' AND username != %s ORDER"
-      " BY id ASC LIMIT 1",
+      " BY RANDOM() LIMIT 1",
       (username,),
   )
   opponent = cur.fetchone()
 
   if opponent:
-    # マッチ成立！両者のステータスを matched に更新
+    # マッチ成立：両者のステータスを matched に更新
     cur.execute(
         "UPDATE online SET status = 'matched' WHERE username IN (%s, %s)",
         (username, opponent["username"]),
@@ -120,7 +118,7 @@ def match_join():
   return jsonify({"status": "waiting"})
 
 
-# --- マッチングキャンセル ---
+# --- サイト離脱時またはキャンセル時の削除 ---
 @app.route("/api/match/cancel", methods=["POST"])
 def match_cancel():
   data = request.json
@@ -132,7 +130,7 @@ def match_cancel():
   conn.commit()
   cur.close()
   conn.close()
-  return jsonify({"status": "cancelled"})
+  return jsonify({"status": "removed"})
 
 
 # --- 二人プレイ：結果送信と勝敗判定 ---
@@ -144,7 +142,7 @@ def match_result():
   p2_name = data.get("player2_name")
   p2_pts = data.get("player2_points")
 
-  # 勝者：5ポイント追加、敗者：3ポイント追加のルール
+  # 勝ったときは5ポイント、負けたときは3ポイント（勝敗ルールに基づく）
   if p1_pts > p2_pts:
     winner = p1_name
     p1_final = p1_pts + 5
@@ -167,7 +165,7 @@ def match_result():
     """,
       (p1_name, p1_final, p2_name, p2_final, winner),
   )
-  # オンラインテーブルから対戦したプレイヤーを削除
+  # マッチ終了後にオンラインテーブルから削除
   cur.execute(
       "DELETE FROM online WHERE username IN (%s, %s)", (p1_name, p2_name)
   )
@@ -178,7 +176,7 @@ def match_result():
   return jsonify({"status": "recorded", "winner": winner})
 
 
-# --- ホーム画面用ランキング（endpoint）取得API ---
+# --- ホーム画面用ランキング取得 ---
 @app.route("/api/ranking", methods=["GET"])
 def get_ranking():
   conn = get_db_connection()
