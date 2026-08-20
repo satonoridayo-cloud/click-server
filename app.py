@@ -56,19 +56,32 @@ def dictfetchone(cur):
 
 
 def init_db():
+    """
+    テーブルを1つずつ個別にコミットする。
+    以前は全テーブルのCREATEを1つのトランザクションにまとめていたため、
+    (例えば新しく追加したテーブルの作成失敗など)どれか1つでも例外が
+    起きると commit() に到達せず、接続クローズ時に暗黙のロールバックが
+    発生し、その前に成功していた他のテーブル作成まで丸ごと消えてしまう
+    という問題があった。1テーブルずつコミットすることでこれを防ぐ。
+    """
     conn = None
     try:
         conn = get_db_connection()
         cur = conn.cursor()
-        cur.execute("""
+    except Exception as e:
+        print(f"Error connecting to database: {e}")
+        return
+
+    table_statements = [
+        ("users", """
             CREATE TABLE IF NOT EXISTS users (
                 id SERIAL PRIMARY KEY,
                 name VARCHAR(100) NOT NULL,
                 email VARCHAR(100) UNIQUE NOT NULL,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
-        """)
-        cur.execute("""
+        """),
+        ("single_results", """
             CREATE TABLE IF NOT EXISTS single_results (
                 id SERIAL PRIMARY KEY,
                 username VARCHAR(100) NOT NULL,
@@ -76,8 +89,8 @@ def init_db():
                 difficulty VARCHAR(20),
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
-        """)
-        cur.execute("""
+        """),
+        ("matches", """
             CREATE TABLE IF NOT EXISTS matches (
                 id SERIAL PRIMARY KEY,
                 player1_name VARCHAR(100) NOT NULL,
@@ -87,7 +100,7 @@ def init_db():
                 winner VARCHAR(100),
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
-        """)
+        """),
         # ============================================================
         # match_sessions: 対戦の「進行中の状態」そのものをDBで管理する。
         # 以前はPythonプロセスのメモリ上の辞書(sessions)で管理していたが、
@@ -99,7 +112,7 @@ def init_db():
         # 方式に変更した。
         # status: 'pending'(結果待ち) / 'finished'(勝敗確定) / 'cancelled'(辞退)
         # ============================================================
-        cur.execute("""
+        ("match_sessions", """
             CREATE TABLE IF NOT EXISTS match_sessions (
                 session_id UUID PRIMARY KEY,
                 player1_name VARCHAR(100) NOT NULL,
@@ -113,15 +126,20 @@ def init_db():
                 cancelled_by VARCHAR(100),
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
-        """)
-        conn.commit()
-        cur.close()
-        print("Database tables checked/created successfully.")
-    except Exception as e:
-        print(f"Error initializing database: {e}")
-    finally:
-        if conn:
-            conn.close()
+        """),
+    ]
+
+    for table_name, ddl in table_statements:
+        try:
+            cur.execute(ddl)
+            conn.commit()  # 1テーブルごとに確定させる
+            print(f"Table '{table_name}' checked/created successfully.")
+        except Exception as e:
+            conn.rollback()
+            print(f"Error creating table '{table_name}': {e}")
+
+    cur.close()
+    conn.close()
 
 
 # Gunicorn等でモジュールとしてimportされて動く本番環境では
