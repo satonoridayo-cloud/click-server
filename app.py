@@ -122,11 +122,14 @@ pending_notifications = {}
 #   "player1": str, "player2": str,
 #   "player1_points": int or None,
 #   "player2_points": int or None,
-#   "created_at": float
+#   "created_at": float,
+#   "cancelled": bool (どちらかが「やめる」を押した場合 True),
+#   "cancelled_by": str (辞退したユーザー名)
 # }
 sessions = {}
 
 SESSION_TIMEOUT_SECONDS = 60 * 10  # 10分放置されたセッションは掃除
+WAITING_QUEUE_TIMEOUT_SECONDS = 60 * 2  # 2分応答のない待機列エントリは掃除
 
 
 def cleanup_stale_sessions():
@@ -137,6 +140,24 @@ def cleanup_stale_sessions():
     ]
     for sid in stale_ids:
         del sessions[sid]
+
+
+def cleanup_stale_waiting_queue():
+    """
+    ブラウザが正常終了できず(sendBeaconが届かない等)、待機列に
+    取り残されたままのプレイヤーを掃除する。
+    正常にポーリングを続けているプレイヤーは match_join のたびに
+    再追加され joined_at が更新されるので、ここで消しても実害はない。
+    """
+    now = time.time()
+    waiting_queue[:] = [
+        p for p in waiting_queue
+        if now - p["joined_at"] <= WAITING_QUEUE_TIMEOUT_SECONDS
+    ]
+
+
+def is_valid_points(value):
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
 
 
 app.config["JSON_AS_ASCII"] = False  # 日本語をエスケープせずJSON化
@@ -248,6 +269,9 @@ def post_single_result():
     if not username or points is None:
         return jsonify({"error": "username and points are required"}), 400
 
+    if not is_valid_points(points):
+        return jsonify({"error": "points must be a number"}), 400
+
     conn = None
     try:
         conn = get_db_connection()
@@ -284,6 +308,7 @@ def match_join():
 
     with lock:
         cleanup_stale_sessions()
+        cleanup_stale_waiting_queue()
 
         # 1. 自分宛にすでに成立した通知があれば渡す
         if username in pending_notifications:
@@ -308,6 +333,8 @@ def match_join():
                 "player1_points": None,
                 "player2_points": None,
                 "created_at": time.time(),
+                "cancelled": False,
+                "cancelled_by": None,
             }
             # 相手側は次のポーリングで受け取れるようにしておく
             pending_notifications[opponent] = {
@@ -320,8 +347,14 @@ def match_join():
                 "session_id": session_id,
             }), 200
 
-        # 3. 誰もいなければ自分を待機列に追加(重複登録は避ける)
-        if not any(p["username"] == username for p in waiting_queue):
+        # 3. 誰もいなければ自分を待機列に追加する
+        #    (既にいる場合は joined_at を更新して「生きている」ことを示す)
+        existing = next(
+            (p for p in waiting_queue if p["username"] == username), None
+        )
+        if existing:
+            existing["joined_at"] = time.time()
+        else:
             waiting_queue.append({"username": username, "joined_at": time.time()})
 
         return jsonify({"status": "waiting"}), 200
@@ -329,14 +362,30 @@ def match_join():
 
 @app.route('/api/match/cancel', methods=['POST'])
 def match_cancel():
+    """
+    待機列からの離脱、または「対戦確認画面」で"やめる"を押した場合に呼ばれる。
+
+    session_id が渡された場合(=マッチング確定後の辞退)は、該当セッションに
+    cancelled フラグを立てる。これにより、もう片方のプレイヤーが結果を
+    送信した際に waiting_for_opponent のまま固まらず、「相手が辞退した」
+    という結果をすぐ受け取れるようにする。
+    """
     data = request.get_json(silent=True) or {}
     username = data.get('username')
+    session_id = data.get('session_id')
     if not username:
         return jsonify({"error": "username is required"}), 400
 
     with lock:
         waiting_queue[:] = [p for p in waiting_queue if p["username"] != username]
         pending_notifications.pop(username, None)
+
+        if session_id:
+            session = sessions.get(session_id)
+            if session and not session.get("finished") \
+                    and username in (session["player1"], session["player2"]):
+                session["cancelled"] = True
+                session["cancelled_by"] = username
 
     return jsonify({"status": "cancelled"}), 200
 
@@ -359,6 +408,9 @@ def match_result():
     if not session_id or not username or points is None:
         return jsonify({"error": "session_id, username and points are required"}), 400
 
+    if not is_valid_points(points):
+        return jsonify({"error": "points must be a number"}), 400
+
     db_insert_needed = False
     response_payload = None
 
@@ -369,6 +421,18 @@ def match_result():
 
         if username not in (session["player1"], session["player2"]):
             return jsonify({"error": "username does not belong to this session"}), 400
+
+        # 相手(または自分)がすでに辞退している場合は、その場で通知して終了
+        if session.get("cancelled"):
+            opponent = (
+                session["player2"] if username == session["player1"]
+                else session["player1"]
+            )
+            del sessions[session_id]
+            return jsonify({
+                "status": "opponent_declined",
+                "opponent": opponent,
+            }), 200
 
         # まだ確定していなければ自分のスコアを記録(確定後は上書きしない)
         if not session.get("finished"):
@@ -450,5 +514,5 @@ def match_result():
 if __name__ == '__main__':
     init_db()
     port = int(os.environ.get("PORT", 5000))
-    debug = os.environ.get("FLASK_ENV") == "development"
+    debug = os.environ.get("FLASK_DEBUG") == "1" or os.environ.get("FLASK_ENV") == "development"
     app.run(host='0.0.0.0', port=port, debug=debug)
