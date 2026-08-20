@@ -344,10 +344,12 @@ def match_cancel():
 @app.route('/api/match/result', methods=['POST'])
 def match_result():
     """
-    フロントは session_id を送ってくる前提で実装しています。
-    (現状のフロントは player1_points / player2_points=0固定 で送っていて
-     相手のスコアを正しく反映できていないので、フロント側も
-     session_id を保持して送るよう修正が必要です。詳細は返信メッセージ参照)
+    session_id を軸に、両者の結果がそろうまで待ち合わせるエンドポイント。
+
+    重要: 結果が確定しても、両者がその結果を受け取る(delivered)まで
+    セッションを消さない。片方だけ先に消してしまうと、もう片方が
+    再ポーリングした時に404になり、正しい勝敗を受け取れないまま
+    フロント側が不整合な表示をしてしまうバグがあったため。
     """
     data = request.get_json(silent=True) or {}
     session_id = data.get('session_id')
@@ -357,38 +359,66 @@ def match_result():
     if not session_id or not username or points is None:
         return jsonify({"error": "session_id, username and points are required"}), 400
 
+    db_insert_needed = False
+    response_payload = None
+
     with lock:
         session = sessions.get(session_id)
         if not session:
             return jsonify({"error": "Session not found or already finished"}), 404
 
-        if username == session["player1"]:
-            session["player1_points"] = points
-        elif username == session["player2"]:
-            session["player2_points"] = points
-        else:
+        if username not in (session["player1"], session["player2"]):
             return jsonify({"error": "username does not belong to this session"}), 400
 
-        both_done = (
-            session["player1_points"] is not None
-            and session["player2_points"] is not None
-        )
+        # まだ確定していなければ自分のスコアを記録(確定後は上書きしない)
+        if not session.get("finished"):
+            if username == session["player1"]:
+                session["player1_points"] = points
+            else:
+                session["player2_points"] = points
 
-        if not both_done:
-            # まだ相手の結果待ち
-            return jsonify({"status": "waiting_for_opponent"}), 200
+            both_done = (
+                session["player1_points"] is not None
+                and session["player2_points"] is not None
+            )
 
-        # 両者そろったので確定してDBに保存
+            if not both_done:
+                return jsonify({"status": "waiting_for_opponent"}), 200
+
+            # 両者そろったのでこの場で一度だけ勝敗を確定させる
+            p1, p2 = session["player1"], session["player2"]
+            p1_pts, p2_pts = session["player1_points"], session["player2_points"]
+            if p1_pts > p2_pts:
+                winner = p1
+            elif p2_pts > p1_pts:
+                winner = p2
+            else:
+                winner = "引き分け"
+
+            session["finished"] = True
+            session["winner"] = winner
+            session["delivered"] = set()
+            db_insert_needed = True
+
+        # ここに来る時点でセッションは確定済み(今回確定した/既に確定していた両方を含む)
         p1, p2 = session["player1"], session["player2"]
         p1_pts, p2_pts = session["player1_points"], session["player2_points"]
-        if p1_pts > p2_pts:
-            winner = p1
-        elif p2_pts > p1_pts:
-            winner = p2
-        else:
-            winner = "引き分け"
+        winner = session["winner"]
+        response_payload = {
+            "status": "finished",
+            "winner": winner,
+            "player1_name": p1, "player1_points": p1_pts,
+            "player2_name": p2, "player2_points": p2_pts,
+        }
 
-        del sessions[session_id]
+        session["delivered"].add(username)
+        if len(session["delivered"]) >= 2:
+            # 両者が結果を受け取ったのでもう不要
+            del sessions[session_id]
+
+    if not db_insert_needed:
+        # 既に確定済みのセッションへの追いつきリクエスト。DB書き込みはしない。
+        return jsonify(response_payload), 200
 
     conn = None
     try:
@@ -400,15 +430,10 @@ def match_result():
             "VALUES (%s, %s, %s, %s, %s) RETURNING *",
             (p1, p1_pts, p2, p2_pts, winner)
         )
-        row = dictfetchone(cur)
+        dictfetchone(cur)
         conn.commit()
         cur.close()
-        return jsonify({
-            "status": "finished",
-            "winner": winner,
-            "player1_name": p1, "player1_points": p1_pts,
-            "player2_name": p2, "player2_points": p2_pts,
-        }), 201
+        return jsonify(response_payload), 201
     except Exception as e:
         if conn:
             conn.rollback()
