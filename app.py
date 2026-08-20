@@ -2,12 +2,13 @@ import os
 import threading
 import time
 import uuid
+import ssl
+from urllib.parse import urlparse
 from datetime import datetime, timedelta
 
 from flask import Flask, jsonify, request
 from flask_cors import CORS
-import psycopg
-from psycopg.rows import dict_row
+import pg8000.dbapi as pg8000
 from dotenv import load_dotenv
 
 # 環境変数の読み込み
@@ -18,13 +19,40 @@ app = Flask(__name__)
 CORS(app)
 
 # ============================================================
-# DB接続
+# DB接続 (pg8000: 純Python実装のPostgreSQLドライバ。C拡張が無いため
+# Pythonバージョンが新しくてもビルド済みバイナリの有無に左右されない)
 # ============================================================
 
 def get_db_connection():
     database_url = os.getenv("DATABASE_URL")
-    conn = psycopg.connect(database_url)
+    parsed = urlparse(database_url)
+
+    # RenderなどのマネージドPostgreSQLは基本SSL接続が必須なので有効化しておく
+    ssl_context = ssl.create_default_context()
+    ssl_context.check_hostname = False
+    ssl_context.verify_mode = ssl.CERT_NONE
+
+    conn = pg8000.connect(
+        user=parsed.username,
+        password=parsed.password,
+        host=parsed.hostname,
+        port=parsed.port or 5432,
+        database=parsed.path.lstrip('/'),
+        ssl_context=ssl_context,
+    )
     return conn
+
+
+def dictfetchall(cur):
+    """pg8000にはRealDictCursor相当が無いので手動で辞書のリストに変換"""
+    columns = [col[0] for col in cur.description]
+    return [dict(zip(columns, row)) for row in cur.fetchall()]
+
+
+def dictfetchone(cur):
+    columns = [col[0] for col in cur.description]
+    row = cur.fetchone()
+    return dict(zip(columns, row)) if row else None
 
 
 def init_db():
@@ -132,9 +160,9 @@ def get_users():
     conn = None
     try:
         conn = get_db_connection()
-        cur = conn.cursor(row_factory=dict_row)
+        cur = conn.cursor()
         cur.execute("SELECT * FROM users ORDER BY id ASC;")
-        users = cur.fetchall()
+        users = dictfetchall(cur)
         cur.close()
         return jsonify(users), 200
     except Exception as e:
@@ -157,10 +185,10 @@ def create_user():
     conn = None
     try:
         conn = get_db_connection()
-        cur = conn.cursor(row_factory=dict_row)
+        cur = conn.cursor()
         query = "INSERT INTO users (name, email) VALUES (%s, %s) RETURNING *"
         cur.execute(query, (name, email))
-        new_user = cur.fetchone()
+        new_user = dictfetchone(cur)
         conn.commit()
         cur.close()
         return jsonify(new_user), 201
@@ -183,7 +211,7 @@ def get_ranking():
     conn = None
     try:
         conn = get_db_connection()
-        cur = conn.cursor(row_factory=dict_row)
+        cur = conn.cursor()
         cur.execute("""
             SELECT created_at, player1_name, player1_points,
                    player2_name, player2_points, winner
@@ -191,7 +219,7 @@ def get_ranking():
             ORDER BY created_at DESC
             LIMIT 50;
         """)
-        rows = cur.fetchall()
+        rows = dictfetchall(cur)
         cur.close()
         # created_atはdatetimeなのでJSONにするためisoformat化
         for r in rows:
@@ -223,13 +251,13 @@ def post_single_result():
     conn = None
     try:
         conn = get_db_connection()
-        cur = conn.cursor(row_factory=dict_row)
+        cur = conn.cursor()
         cur.execute(
             "INSERT INTO single_results (username, points, difficulty) "
             "VALUES (%s, %s, %s) RETURNING *",
             (username, points, difficulty)
         )
-        row = cur.fetchone()
+        row = dictfetchone(cur)
         conn.commit()
         cur.close()
         return jsonify(row), 201
@@ -365,14 +393,14 @@ def match_result():
     conn = None
     try:
         conn = get_db_connection()
-        cur = conn.cursor(row_factory=dict_row)
+        cur = conn.cursor()
         cur.execute(
             "INSERT INTO matches "
             "(player1_name, player1_points, player2_name, player2_points, winner) "
             "VALUES (%s, %s, %s, %s, %s) RETURNING *",
             (p1, p1_pts, p2, p2_pts, winner)
         )
-        row = cur.fetchone()
+        row = dictfetchone(cur)
         conn.commit()
         cur.close()
         return jsonify({
