@@ -88,6 +88,32 @@ def init_db():
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         """)
+        # ============================================================
+        # match_sessions: 対戦の「進行中の状態」そのものをDBで管理する。
+        # 以前はPythonプロセスのメモリ上の辞書(sessions)で管理していたが、
+        # ・複数プレイヤーからの同時アクセス
+        # ・通信の遅延やリトライによる多重リクエスト
+        # ・将来的なワーカー複数化やサーバー再起動
+        # といったケースで不整合が起きうるため、DBを正(source of truth)
+        # として、行ロック(SELECT ... FOR UPDATE)を使って勝敗を確定させる
+        # 方式に変更した。
+        # status: 'pending'(結果待ち) / 'finished'(勝敗確定) / 'cancelled'(辞退)
+        # ============================================================
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS match_sessions (
+                session_id UUID PRIMARY KEY,
+                player1_name VARCHAR(100) NOT NULL,
+                player2_name VARCHAR(100) NOT NULL,
+                player1_points INTEGER,
+                player2_points INTEGER,
+                winner VARCHAR(100),
+                status VARCHAR(20) NOT NULL DEFAULT 'pending',
+                player1_delivered BOOLEAN NOT NULL DEFAULT FALSE,
+                player2_delivered BOOLEAN NOT NULL DEFAULT FALSE,
+                cancelled_by VARCHAR(100),
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
         conn.commit()
         cur.close()
         print("Database tables checked/created successfully.")
@@ -99,13 +125,14 @@ def init_db():
 
 
 # ============================================================
-# マッチング / 対戦セッション管理 (インメモリ)
+# マッチング待機列 (インメモリ)
 #
-# 注意: これはプロセス内メモリで状態を持つ実装です。
-# Render等で Gunicorn のワーカーを複数(--workers 2 以上)にすると
-# ワーカーごとにメモリが別になり、マッチングが機能しなくなります。
-# 必ず 1 ワーカーで運用するか、将来的にRedis等の共有ストアに
-# 置き換えてください。
+# ここに残っているのは「まだ相手が決まっていない人同士を組み合わせる」
+# だけの一時的な処理。組み合わせが決まった後の点数記録・勝敗判定は
+# すべて match_sessions テーブル(DB側)で行う。
+#
+# 注意: 待機列自体は依然インメモリなので、Gunicornのワーカーを複数に
+# する場合はここだけは共有ストア(Redis等)への置き換えが必要。
 # ============================================================
 
 lock = threading.Lock()
@@ -117,29 +144,7 @@ waiting_queue = []
 # username -> {"opponent": str, "session_id": str}
 pending_notifications = {}
 
-# 進行中/結果待ちの対戦セッション
-# session_id -> {
-#   "player1": str, "player2": str,
-#   "player1_points": int or None,
-#   "player2_points": int or None,
-#   "created_at": float,
-#   "cancelled": bool (どちらかが「やめる」を押した場合 True),
-#   "cancelled_by": str (辞退したユーザー名)
-# }
-sessions = {}
-
-SESSION_TIMEOUT_SECONDS = 60 * 10  # 10分放置されたセッションは掃除
 WAITING_QUEUE_TIMEOUT_SECONDS = 60 * 2  # 2分応答のない待機列エントリは掃除
-
-
-def cleanup_stale_sessions():
-    now = time.time()
-    stale_ids = [
-        sid for sid, s in sessions.items()
-        if now - s["created_at"] > SESSION_TIMEOUT_SECONDS
-    ]
-    for sid in stale_ids:
-        del sessions[sid]
 
 
 def cleanup_stale_waiting_queue():
@@ -307,7 +312,6 @@ def match_join():
         return jsonify({"error": "username is required"}), 400
 
     with lock:
-        cleanup_stale_sessions()
         cleanup_stale_waiting_queue()
 
         # 1. 自分宛にすでに成立した通知があれば渡す
@@ -327,15 +331,32 @@ def match_join():
             waiting_queue.remove(candidate)
             opponent = candidate["username"]
             session_id = str(uuid.uuid4())
-            sessions[session_id] = {
-                "player1": username,
-                "player2": opponent,
-                "player1_points": None,
-                "player2_points": None,
-                "created_at": time.time(),
-                "cancelled": False,
-                "cancelled_by": None,
-            }
+
+            # 対戦セッションの本体はDBに作る(勝敗判定の正はDB)
+            conn = None
+            try:
+                conn = get_db_connection()
+                cur = conn.cursor()
+                cur.execute(
+                    "INSERT INTO match_sessions "
+                    "(session_id, player1_name, player2_name, status) "
+                    "VALUES (%s, %s, %s, 'pending')",
+                    (session_id, username, opponent)
+                )
+                conn.commit()
+                cur.close()
+            except Exception as e:
+                if conn:
+                    conn.rollback()
+                print(f"match_join: failed to create match_sessions row: {e}")
+                # DB作成に失敗した場合はマッチング自体を無かったことにし、
+                # 相手を待機列に戻す
+                waiting_queue.append(candidate)
+                return jsonify({"error": "matching failed, please retry"}), 500
+            finally:
+                if conn:
+                    conn.close()
+
             # 相手側は次のポーリングで受け取れるようにしておく
             pending_notifications[opponent] = {
                 "opponent": username,
@@ -365,10 +386,10 @@ def match_cancel():
     """
     待機列からの離脱、または「対戦確認画面」で"やめる"を押した場合に呼ばれる。
 
-    session_id が渡された場合(=マッチング確定後の辞退)は、該当セッションに
-    cancelled フラグを立てる。これにより、もう片方のプレイヤーが結果を
-    送信した際に waiting_for_opponent のまま固まらず、「相手が辞退した」
-    という結果をすぐ受け取れるようにする。
+    session_id が渡された場合(=マッチング確定後の辞退)は、DB上の
+    match_sessions.status を 'cancelled' にする。これにより、もう片方の
+    プレイヤーが結果を送信した際に waiting_for_opponent のまま固まらず、
+    「相手が辞退した」という結果をすぐ受け取れるようにする。
     """
     data = request.get_json(silent=True) or {}
     username = data.get('username')
@@ -380,12 +401,25 @@ def match_cancel():
         waiting_queue[:] = [p for p in waiting_queue if p["username"] != username]
         pending_notifications.pop(username, None)
 
-        if session_id:
-            session = sessions.get(session_id)
-            if session and not session.get("finished") \
-                    and username in (session["player1"], session["player2"]):
-                session["cancelled"] = True
-                session["cancelled_by"] = username
+    if session_id:
+        conn = None
+        try:
+            conn = get_db_connection()
+            cur = conn.cursor()
+            cur.execute(
+                "UPDATE match_sessions SET status = 'cancelled', cancelled_by = %s "
+                "WHERE session_id = %s AND status = 'pending'",
+                (username, session_id)
+            )
+            conn.commit()
+            cur.close()
+        except Exception as e:
+            if conn:
+                conn.rollback()
+            print(f"match_cancel: failed to update match_sessions: {e}")
+        finally:
+            if conn:
+                conn.close()
 
     return jsonify({"status": "cancelled"}), 200
 
@@ -393,12 +427,12 @@ def match_cancel():
 @app.route('/api/match/result', methods=['POST'])
 def match_result():
     """
-    session_id を軸に、両者の結果がそろうまで待ち合わせるエンドポイント。
+    勝敗の判定と記録はすべてDB(match_sessionsテーブル)を正として行う。
 
-    重要: 結果が確定しても、両者がその結果を受け取る(delivered)まで
-    セッションを消さない。片方だけ先に消してしまうと、もう片方が
-    再ポーリングした時に404になり、正しい勝敗を受け取れないまま
-    フロント側が不整合な表示をしてしまうバグがあったため。
+    SELECT ... FOR UPDATE で対象行をロックしてから読み書きするので、
+    両プレイヤーからのリクエストがほぼ同時に来ても、通信の遅延・
+    リトライ・順序の入れ替わりに関係なく、DBに書き込まれた値だけを
+    見て一意に勝敗が決まる(メモリ上の状態とDBの状態がズレる心配がない)。
     """
     data = request.get_json(silent=True) or {}
     session_id = data.get('session_id')
@@ -411,104 +445,116 @@ def match_result():
     if not is_valid_points(points):
         return jsonify({"error": "points must be a number"}), 400
 
-    db_insert_needed = False
-    response_payload = None
+    conn = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
 
-    with lock:
-        session = sessions.get(session_id)
-        if not session:
-            return jsonify({"error": "Session not found or already finished"}), 404
+        # 対象セッション行をロックして取得(他のリクエストはここで待たされる)
+        cur.execute(
+            "SELECT session_id, player1_name, player2_name, "
+            "player1_points, player2_points, winner, status, "
+            "player1_delivered, player2_delivered "
+            "FROM match_sessions WHERE session_id = %s FOR UPDATE",
+            (session_id,)
+        )
+        row = dictfetchone(cur)
 
-        if username not in (session["player1"], session["player2"]):
+        if not row:
+            conn.rollback()
+            return jsonify({"error": "Session not found"}), 404
+
+        if username not in (row["player1_name"], row["player2_name"]):
+            conn.rollback()
             return jsonify({"error": "username does not belong to this session"}), 400
 
-        # 相手(または自分)がすでに辞退している場合は、その場で通知して終了
-        if session.get("cancelled"):
-            opponent = (
-                session["player2"] if username == session["player1"]
-                else session["player1"]
-            )
-            del sessions[session_id]
+        is_player1 = username == row["player1_name"]
+
+        # 相手(または自分)がすでに辞退している場合
+        if row["status"] == 'cancelled':
+            opponent = row["player2_name"] if is_player1 else row["player1_name"]
+            conn.commit()
+            cur.close()
             return jsonify({
                 "status": "opponent_declined",
                 "opponent": opponent,
             }), 200
 
-        # まだ確定していなければ自分のスコアを記録(確定後は上書きしない)
-        if not session.get("finished"):
-            if username == session["player1"]:
-                session["player1_points"] = points
+        # まだ勝敗が確定していなければ、自分のスコアをDBに記録する
+        if row["status"] == 'pending':
+            if is_player1:
+                cur.execute(
+                    "UPDATE match_sessions SET player1_points = %s WHERE session_id = %s",
+                    (points, session_id)
+                )
+                row["player1_points"] = points
             else:
-                session["player2_points"] = points
+                cur.execute(
+                    "UPDATE match_sessions SET player2_points = %s WHERE session_id = %s",
+                    (points, session_id)
+                )
+                row["player2_points"] = points
 
             both_done = (
-                session["player1_points"] is not None
-                and session["player2_points"] is not None
+                row["player1_points"] is not None
+                and row["player2_points"] is not None
             )
 
             if not both_done:
+                conn.commit()
+                cur.close()
                 return jsonify({"status": "waiting_for_opponent"}), 200
 
-            # 両者そろったのでこの場で一度だけ勝敗を確定させる
-            p1, p2 = session["player1"], session["player2"]
-            p1_pts, p2_pts = session["player1_points"], session["player2_points"]
+            # 両者そろったので、DBに記録された値だけを見て勝敗を確定させる
+            p1_pts, p2_pts = row["player1_points"], row["player2_points"]
             if p1_pts > p2_pts:
-                winner = p1
+                winner = row["player1_name"]
             elif p2_pts > p1_pts:
-                winner = p2
+                winner = row["player2_name"]
             else:
                 winner = "引き分け"
 
-            session["finished"] = True
-            session["winner"] = winner
-            session["delivered"] = set()
-            db_insert_needed = True
+            cur.execute(
+                "UPDATE match_sessions SET status = 'finished', winner = %s "
+                "WHERE session_id = %s",
+                (winner, session_id)
+            )
+            row["status"] = "finished"
+            row["winner"] = winner
 
-        # ここに来る時点でセッションは確定済み(今回確定した/既に確定していた両方を含む)
-        p1, p2 = session["player1"], session["player2"]
-        p1_pts, p2_pts = session["player1_points"], session["player2_points"]
-        winner = session["winner"]
-        response_payload = {
-            "status": "finished",
-            "winner": winner,
-            "player1_name": p1, "player1_points": p1_pts,
-            "player2_name": p2, "player2_points": p2_pts,
-        }
+            # ランキング表示用のmatchesテーブルにも保存
+            cur.execute(
+                "INSERT INTO matches "
+                "(player1_name, player1_points, player2_name, player2_points, winner) "
+                "VALUES (%s, %s, %s, %s, %s)",
+                (row["player1_name"], p1_pts, row["player2_name"], p2_pts, winner)
+            )
 
-        session["delivered"].add(username)
-        if len(session["delivered"]) >= 2:
-            # 両者が結果を受け取ったのでもう不要
-            del sessions[session_id]
-
-    if not db_insert_needed:
-        # 既に確定済みのセッションへの追いつきリクエスト。DB書き込みはしない。
-        return jsonify(response_payload), 200
-
-    # DB保存は「結果をプレイヤーに返せるかどうか」とは切り離す。
-    # ここが失敗しても、勝敗自体は既にメモリ上で確定しているので
-    # プレイヤーには正しく結果を返す(500にしない)。
-    conn = None
-    try:
-        conn = get_db_connection()
-        cur = conn.cursor()
+        # ここに来る時点で status = 'finished' (今回確定/既に確定済みの両方を含む)
+        delivered_col = "player1_delivered" if is_player1 else "player2_delivered"
         cur.execute(
-            "INSERT INTO matches "
-            "(player1_name, player1_points, player2_name, player2_points, winner) "
-            "VALUES (%s, %s, %s, %s, %s) RETURNING *",
-            (p1, p1_pts, p2, p2_pts, winner)
+            f"UPDATE match_sessions SET {delivered_col} = TRUE WHERE session_id = %s",
+            (session_id,)
         )
-        dictfetchone(cur)
+
         conn.commit()
         cur.close()
+
+        return jsonify({
+            "status": "finished",
+            "winner": row["winner"],
+            "player1_name": row["player1_name"], "player1_points": row["player1_points"],
+            "player2_name": row["player2_name"], "player2_points": row["player2_points"],
+        }), 200
+
     except Exception as e:
         if conn:
             conn.rollback()
-        print(f"match_result: failed to save match to DB (result still returned to player): {e}")
+        print(f"match_result error: {e}")
+        return jsonify({"error": "Internal Server Error"}), 500
     finally:
         if conn:
             conn.close()
-
-    return jsonify(response_payload), 200
 
 
 if __name__ == '__main__':
