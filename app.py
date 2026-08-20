@@ -6,8 +6,8 @@ from datetime import datetime, timedelta
 
 from flask import Flask, jsonify, request
 from flask_cors import CORS
-import psycopg2
-from psycopg2.extras import RealDictCursor
+import psycopg
+from psycopg.rows import dict_row
 from dotenv import load_dotenv
 
 # 環境変数の読み込み
@@ -23,7 +23,7 @@ CORS(app)
 
 def get_db_connection():
     database_url = os.getenv("DATABASE_URL")
-    conn = psycopg2.connect(database_url)
+    conn = psycopg.connect(database_url)
     return conn
 
 
@@ -132,7 +132,7 @@ def get_users():
     conn = None
     try:
         conn = get_db_connection()
-        cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur = conn.cursor(row_factory=dict_row)
         cur.execute("SELECT * FROM users ORDER BY id ASC;")
         users = cur.fetchall()
         cur.close()
@@ -157,7 +157,7 @@ def create_user():
     conn = None
     try:
         conn = get_db_connection()
-        cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur = conn.cursor(row_factory=dict_row)
         query = "INSERT INTO users (name, email) VALUES (%s, %s) RETURNING *"
         cur.execute(query, (name, email))
         new_user = cur.fetchone()
@@ -183,7 +183,7 @@ def get_ranking():
     conn = None
     try:
         conn = get_db_connection()
-        cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur = conn.cursor(row_factory=dict_row)
         cur.execute("""
             SELECT created_at, player1_name, player1_points,
                    player2_name, player2_points, winner
@@ -223,7 +223,7 @@ def post_single_result():
     conn = None
     try:
         conn = get_db_connection()
-        cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur = conn.cursor(row_factory=dict_row)
         cur.execute(
             "INSERT INTO single_results (username, points, difficulty) "
             "VALUES (%s, %s, %s) RETURNING *",
@@ -365,7 +365,7 @@ def match_result():
     conn = None
     try:
         conn = get_db_connection()
-        cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur = conn.cursor(row_factory=dict_row)
         cur.execute(
             "INSERT INTO matches "
             "(player1_name, player1_points, player2_name, player2_points, winner) "
