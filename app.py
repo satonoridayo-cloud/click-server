@@ -1,192 +1,88 @@
-from datetime import datetime
 import os
 from flask import Flask, jsonify, request
-from flask_cors import CORS
 import psycopg2
 from psycopg2.extras import RealDictCursor
+from dotenv import load_dotenv
+
+# 環境変数の読み込み
+load_dotenv()
 
 app = Flask(__name__)
-CORS(app, resources={r"/api/*": {"origins": "*"}})
 
-# ご提示いただいたPostgreSQLの接続URL
-DATABASE_URL = "postgresql://click_7fat_user:NBGd2zod8zoHEiWraPSftUuzP9jDi6K5@dpg-da1e8o3l550s73fg2le0-a.virginia-postgres.render.com/click_7fat"
-
-
+# データベース接続を取得する関数
 def get_db_connection():
-  return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
+    database_url = os.getenv("DATABASE_URL")
+    # psycopg2でPostgreSQLに接続
+    conn = psycopg2.connect(database_url)
+    return conn
 
-
+# 起動時にテーブルを作成する関数
 def init_db():
-  conn = get_db_connection()
-  cur = conn.cursor()
-  cur.execute("""
-        CREATE TABLE IF NOT EXISTS online (
-            id SERIAL PRIMARY KEY,
-            username VARCHAR(100) NOT NULL,
-            status VARCHAR(50) DEFAULT 'waiting',
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-    """)
-  cur.execute("""
-        CREATE TABLE IF NOT EXISTS endpoint (
-            id SERIAL PRIMARY KEY,
-            player1_name VARCHAR(100),
-            player1_points INT,
-            player2_name VARCHAR(100),
-            player2_points INT,
-            winner VARCHAR(100),
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        );
-    """)
-  conn.commit()
-  cur.close()
-  conn.close()
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS users (
+                id SERIAL PRIMARY KEY,
+                name VARCHAR(100) NOT NULL,
+                email VARCHAR(100) UNIQUE NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+        conn.commit()
+        cur.close()
+        conn.close()
+        print("Database table checked/created successfully.")
+    except Exception as e:
+        print(f"Error initializing database: {e}")
 
-
+# アプリ起動時にテーブル初期化を実行
 init_db()
 
+# 1. ユーザー一覧取得 (GET /users)
+@app.route('/users', methods=['GET'])
+def get_users():
+    try:
+        conn = get_db_connection()
+        # RealDictCursorを使うことで、結果を辞書型（JSONにしやすい形）で取得できる
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur.execute("SELECT * FROM users ORDER BY id ASC;")
+        users = cur.fetchall()
+        cur.close()
+        conn.close()
+        return jsonify(users), 200
+    except Exception as e:
+        print(e)
+        return jsonify({"error": "Internal Server Error"}), 500
 
-@app.route("/")
-def index():
-  return "Click Game Backend API is running!"
+# 2. ユーザー登録 (POST /users)
+@app.route('/users', methods=['POST'])
+def create_user():
+    data = request.get_json()
+    name = data.get('name')
+    email = data.get('email')
 
+    if not name or not email:
+        return jsonify({"error": "Name and email are required"}), 400
 
-# --- 一人プレイ結果保存用API ---
-@app.route("/api/single_result", methods=["POST"])
-def single_result():
-  data = request.json
-  username = data.get("username")
-  points = data.get("points")
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        
+        query = "INSERT INTO users (name, email) VALUES (%s, %s) RETURNING *"
+        cur.execute(query, (name, email))
+        new_user = cur.fetchone()
+        
+        conn.commit()
+        cur.close()
+        conn.close()
+        
+        return jsonify(new_user), 201
+    except Exception as e:
+        print(e)
+        return jsonify({"error": "Database error or email already exists"}), 500
 
-  conn = get_db_connection()
-  cur = conn.cursor()
-  cur.execute(
-      """
-        INSERT INTO endpoint (player1_name, player1_points, player2_name, player2_points, winner)
-        VALUES (%s, %s, 'CPU', 0, %s)
-    """,
-      (username, points, username),
-  )
-  conn.commit()
-  cur.close()
-  conn.close()
-  return jsonify({"status": "success"})
-
-
-# --- 二人プレイ：オンラインテーブルへの追加・ランダムマッチング ---
-@app.route("/api/match/join", methods=["POST"])
-def match_join():
-  data = request.json
-  username = data.get("username")
-
-  conn = get_db_connection()
-  cur = conn.cursor()
-
-  # すでに自分が登録されているか確認
-  cur.execute("SELECT * FROM online WHERE username = %s", (username,))
-  me = cur.fetchone()
-
-  if not me:
-    # 登録されていなければ waiting として追加
-    cur.execute(
-        "INSERT INTO online (username, status) VALUES (%s, 'waiting')",
-        (username,),
-    )
-    conn.commit()
-
-  # 自分以外の waiting 状態のプレイヤーから「ランダム」に1人取得
-  cur.execute(
-      "SELECT * FROM online WHERE status = 'waiting' AND username != %s ORDER"
-      " BY RANDOM() LIMIT 1",
-      (username,),
-  )
-  opponent = cur.fetchone()
-
-  if opponent:
-    # マッチ成立：両者のステータスを matched に更新
-    cur.execute(
-        "UPDATE online SET status = 'matched' WHERE username IN (%s, %s)",
-        (username, opponent["username"]),
-    )
-    conn.commit()
-    cur.close()
-    conn.close()
-    return jsonify({"status": "matched", "opponent": opponent["username"]})
-
-  cur.close()
-  conn.close()
-  return jsonify({"status": "waiting"})
-
-
-# --- サイト離脱時またはキャンセル時の削除 ---
-@app.route("/api/match/cancel", methods=["POST"])
-def match_cancel():
-  data = request.json
-  username = data.get("username")
-
-  conn = get_db_connection()
-  cur = conn.cursor()
-  cur.execute("DELETE FROM online WHERE username = %s", (username,))
-  conn.commit()
-  cur.close()
-  conn.close()
-  return jsonify({"status": "removed"})
-
-
-# --- 二人プレイ：結果送信と勝敗判定 ---
-@app.route("/api/match/result", methods=["POST"])
-def match_result():
-  data = request.json
-  p1_name = data.get("player1_name")
-  p1_pts = data.get("player1_points")
-  p2_name = data.get("player2_name")
-  p2_pts = data.get("player2_points")
-
-  # 勝ったときは5ポイント、負けたときは3ポイント（勝敗ルールに基づく）
-  if p1_pts > p2_pts:
-    winner = p1_name
-    p1_final = p1_pts + 5
-    p2_final = p2_pts + 3
-  elif p2_pts > p1_pts:
-    winner = p2_name
-    p1_final = p1_pts + 3
-    p2_final = p2_pts + 5
-  else:
-    winner = "引き分け"
-    p1_final = p1_pts
-    p2_final = p2_pts
-
-  conn = get_db_connection()
-  cur = conn.cursor()
-  cur.execute(
-      """
-        INSERT INTO endpoint (player1_name, player1_points, player2_name, player2_points, winner)
-        VALUES (%s, %s, %s, %s, %s)
-    """,
-      (p1_name, p1_final, p2_name, p2_final, winner),
-  )
-  # マッチ終了後にオンラインテーブルから削除
-  cur.execute(
-      "DELETE FROM online WHERE username IN (%s, %s)", (p1_name, p2_name)
-  )
-  conn.commit()
-  cur.close()
-  conn.close()
-
-  return jsonify({"status": "recorded", "winner": winner})
-
-
-# --- ホーム画面用ランキング取得 ---
-@app.route("/api/ranking", methods=["GET"])
-def get_ranking():
-  conn = get_db_connection()
-  cur = conn.cursor()
-  cur.execute("SELECT * FROM endpoint ORDER BY id DESC LIMIT 10;")
-  rows = cur.fetchall()
-  cur.close()
-  conn.close()
-  return jsonify(rows)
-
-
-if __name__ == "__main__":
-  app.run(debug=True, port=5000)
+if __name__ == '__main__':
+    # ローカル実行時のポート設定（RenderではGunicornなどのWSGIサーバーを使うのが一般的）
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host='0.0.0.0', port=port, debug=True)
