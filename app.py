@@ -420,6 +420,9 @@ def match_result():
         # 既に確定済みのセッションへの追いつきリクエスト。DB書き込みはしない。
         return jsonify(response_payload), 200
 
+    # DB保存は「結果をプレイヤーに返せるかどうか」とは切り離す。
+    # ここが失敗しても、勝敗自体は既にメモリ上で確定しているので
+    # プレイヤーには正しく結果を返す(500にしない)。
     conn = None
     try:
         conn = get_db_connection()
@@ -433,15 +436,15 @@ def match_result():
         dictfetchone(cur)
         conn.commit()
         cur.close()
-        return jsonify(response_payload), 201
     except Exception as e:
         if conn:
             conn.rollback()
-        print(e)
-        return jsonify({"error": "Internal Server Error"}), 500
+        print(f"match_result: failed to save match to DB (result still returned to player): {e}")
     finally:
         if conn:
             conn.close()
+
+    return jsonify(response_payload), 200
 
 
 if __name__ == '__main__':
