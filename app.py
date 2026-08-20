@@ -18,6 +18,7 @@ def get_db_connection():
 
 # 起動時にテーブルを作成する関数
 def init_db():
+    conn = None
     try:
         conn = get_db_connection()
         cur = conn.cursor()
@@ -31,17 +32,20 @@ def init_db():
         """)
         conn.commit()
         cur.close()
-        conn.close()
         print("Database table checked/created successfully.")
     except Exception as e:
         print(f"Error initializing database: {e}")
+    finally:
+        if conn:
+            conn.close()
 
 # アプリ起動時にテーブル初期化を実行
-init_db()
+# (リローダーによる二重実行を避けるため __main__ ブロック側に移動)
 
 # 1. ユーザー一覧取得 (GET /users)
 @app.route('/users', methods=['GET'])
 def get_users():
+    conn = None
     try:
         conn = get_db_connection()
         # RealDictCursorを使うことで、結果を辞書型（JSONにしやすい形）で取得できる
@@ -49,40 +53,52 @@ def get_users():
         cur.execute("SELECT * FROM users ORDER BY id ASC;")
         users = cur.fetchall()
         cur.close()
-        conn.close()
         return jsonify(users), 200
     except Exception as e:
         print(e)
         return jsonify({"error": "Internal Server Error"}), 500
+    finally:
+        if conn:
+            conn.close()
 
 # 2. ユーザー登録 (POST /users)
 @app.route('/users', methods=['POST'])
 def create_user():
-    data = request.get_json()
+    data = request.get_json(silent=True) or {}
     name = data.get('name')
     email = data.get('email')
 
     if not name or not email:
         return jsonify({"error": "Name and email are required"}), 400
 
+    conn = None
     try:
         conn = get_db_connection()
         cur = conn.cursor(cursor_factory=RealDictCursor)
-        
+
         query = "INSERT INTO users (name, email) VALUES (%s, %s) RETURNING *"
         cur.execute(query, (name, email))
         new_user = cur.fetchone()
-        
+
         conn.commit()
         cur.close()
-        conn.close()
-        
+
         return jsonify(new_user), 201
     except Exception as e:
+        if conn:
+            conn.rollback()
         print(e)
         return jsonify({"error": "Database error or email already exists"}), 500
+    finally:
+        if conn:
+            conn.close()
 
 if __name__ == '__main__':
+    # 起動時にテーブル初期化を実行（リローダーの子プロセスのみで実行される）
+    init_db()
+
     # ローカル実行時のポート設定（RenderではGunicornなどのWSGIサーバーを使うのが一般的）
     port = int(os.environ.get("PORT", 5000))
-    app.run(host='0.0.0.0', port=port, debug=True)
+    # 本番では FLASK_ENV=development が設定されていない限り debug=False になる
+    debug = os.environ.get("FLASK_ENV") == "development"
+    app.run(host='0.0.0.0', port=port, debug=debug)
