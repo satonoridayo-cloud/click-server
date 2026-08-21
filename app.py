@@ -145,6 +145,31 @@ def init_db():
                 joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         """),
+        # ============================================================
+        # online_players: 「今サイトにいる人」をDBの行で管理する。
+        # フロントが定期的にハートビートを送るたびに last_seen を更新し、
+        # 一定時間ハートビートが来なければ(離脱扱いで)行ごと削除する。
+        # ページを閉じる際は sendBeacon で明示的にも削除する。
+        # ============================================================
+        ("online_players", """
+            CREATE TABLE IF NOT EXISTS online_players (
+                username VARCHAR(100) PRIMARY KEY,
+                last_seen TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """),
+        # ============================================================
+        # player_points: プレイヤーごとの累計獲得ポイント(ポイント
+        # ランキング用)。以前はブラウザのlocalStorageにしか無く、
+        # 他の人と比較できなかったため、サーバー側で一元管理する。
+        # 勝った時にその回のポイント分だけ加算する。
+        # ============================================================
+        ("player_points", """
+            CREATE TABLE IF NOT EXISTS player_points (
+                username VARCHAR(100) PRIMARY KEY,
+                total_points INTEGER NOT NULL DEFAULT 0,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """),
     ]
 
     for table_name, ddl in table_statements:
@@ -178,10 +203,26 @@ init_db()
 # ============================================================
 
 WAITING_QUEUE_TIMEOUT_SECONDS = 60 * 2  # 2分応答のない待機行は掃除
+ONLINE_TIMEOUT_SECONDS = 25  # これだけハートビートが無ければオフライン扱い
 
 
 def is_valid_points(value):
     return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def award_points(cur, username, amount):
+    """
+    プレイヤーの累計ポイントに加算する(UPSERT)。
+    呼び出し側のトランザクション内で実行され、呼び出し側がcommitする。
+    """
+    cur.execute(
+        "INSERT INTO player_points (username, total_points, updated_at) "
+        "VALUES (%s, %s, CURRENT_TIMESTAMP) "
+        "ON CONFLICT (username) DO UPDATE SET "
+        "total_points = player_points.total_points + %s, "
+        "updated_at = CURRENT_TIMESTAMP",
+        (username, amount, amount)
+    )
 
 
 app.config["JSON_AS_ASCII"] = False  # 日本語をエスケープせずJSON化
@@ -279,6 +320,32 @@ def get_ranking():
             conn.close()
 
 
+@app.route('/api/points_ranking', methods=['GET'])
+def get_points_ranking():
+    """
+    累計獲得ポイントの多い順ランキング(player_pointsテーブルが正)。
+    """
+    conn = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT username, total_points
+            FROM player_points
+            ORDER BY total_points DESC
+            LIMIT 50;
+        """)
+        rows = dictfetchall(cur)
+        cur.close()
+        return jsonify(rows), 200
+    except Exception as e:
+        print(e)
+        return jsonify({"error": "Internal Server Error"}), 500
+    finally:
+        if conn:
+            conn.close()
+
+
 # ============================================================
 # 一人プレイ結果
 # ============================================================
@@ -289,6 +356,7 @@ def post_single_result():
     username = data.get('username')
     points = data.get('points')
     difficulty = data.get('difficulty')  # フロント側が送るなら受け取る(任意)
+    won = bool(data.get('won'))  # 勝った場合だけポイントランキングに加算する
 
     if not username or points is None:
         return jsonify({"error": "username and points are required"}), 400
@@ -306,6 +374,10 @@ def post_single_result():
             (username, points, difficulty)
         )
         row = dictfetchone(cur)
+
+        if won:
+            award_points(cur, username, points)
+
         conn.commit()
         cur.close()
         return jsonify(row), 201
@@ -313,6 +385,98 @@ def post_single_result():
         if conn:
             conn.rollback()
         print(e)
+        return jsonify({"error": "Internal Server Error"}), 500
+    finally:
+        if conn:
+            conn.close()
+
+
+# ============================================================
+# オンラインプレゼンス(今サイトにいる人)
+# ============================================================
+
+@app.route('/api/presence/heartbeat', methods=['POST'])
+def presence_heartbeat():
+    """
+    フロントが定期的に呼ぶ「まだ見ています」の合図。
+    呼ぶたびに last_seen を更新(UPSERT)し、ついでに一定時間
+    音沙汰のない他のプレイヤーの行も掃除する。
+    """
+    data = request.get_json(silent=True) or {}
+    username = data.get('username')
+    if not username:
+        return jsonify({"error": "username is required"}), 400
+
+    conn = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO online_players (username, last_seen) "
+            "VALUES (%s, CURRENT_TIMESTAMP) "
+            "ON CONFLICT (username) DO UPDATE SET last_seen = CURRENT_TIMESTAMP",
+            (username,)
+        )
+        cutoff = datetime.utcnow() - timedelta(seconds=ONLINE_TIMEOUT_SECONDS)
+        cur.execute("DELETE FROM online_players WHERE last_seen < %s", (cutoff,))
+        conn.commit()
+        cur.close()
+        return jsonify({"status": "ok"}), 200
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        print(f"presence_heartbeat error: {e}")
+        return jsonify({"error": "Internal Server Error"}), 500
+    finally:
+        if conn:
+            conn.close()
+
+
+@app.route('/api/presence/leave', methods=['POST'])
+def presence_leave():
+    """
+    ページを閉じる時に sendBeacon で呼ばれる。即座にリストから消す。
+    (これが届かなかった場合でも、ハートビート切れでいずれ自動的に
+     online_players から消える)
+    """
+    data = request.get_json(silent=True) or {}
+    username = data.get('username')
+    if not username:
+        return jsonify({"error": "username is required"}), 400
+
+    conn = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cur.execute("DELETE FROM online_players WHERE username = %s", (username,))
+        conn.commit()
+        cur.close()
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        print(f"presence_leave error: {e}")
+    finally:
+        if conn:
+            conn.close()
+
+    return jsonify({"status": "ok"}), 200
+
+
+@app.route('/api/presence/online', methods=['GET'])
+def presence_online():
+    conn = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
+        cutoff = datetime.utcnow() - timedelta(seconds=ONLINE_TIMEOUT_SECONDS)
+        cur.execute("DELETE FROM online_players WHERE last_seen < %s", (cutoff,))
+        conn.commit()
+        cur.execute("SELECT username FROM online_players ORDER BY username ASC")
+        rows = dictfetchall(cur)
+        cur.close()
+        return jsonify([r["username"] for r in rows]), 200
+    except Exception as e:
+        print(f"presence_online error: {e}")
         return jsonify({"error": "Internal Server Error"}), 500
     finally:
         if conn:
@@ -461,24 +625,24 @@ def match_cancel():
     session_id = data.get('session_id')
     if not username:
         return jsonify({"error": "username is required"}), 400
-
+ 
     conn = None
     try:
         conn = get_db_connection()
         cur = conn.cursor()
-
+ 
         cur.execute(
             "DELETE FROM waiting_players WHERE username = %s AND session_id IS NULL",
             (username,)
         )
-
+ 
         if session_id:
             cur.execute(
                 "UPDATE match_sessions SET status = 'cancelled', cancelled_by = %s "
                 "WHERE session_id = %s AND status = 'pending'",
                 (username, session_id)
             )
-
+ 
         conn.commit()
         cur.close()
     except Exception as e:
@@ -488,15 +652,15 @@ def match_cancel():
     finally:
         if conn:
             conn.close()
-
+ 
     return jsonify({"status": "cancelled"}), 200
-
-
+ 
+ 
 @app.route('/api/match/result', methods=['POST'])
 def match_result():
     """
     勝敗の判定と記録はすべてDB(match_sessionsテーブル)を正として行う。
-
+ 
     SELECT ... FOR UPDATE で対象行をロックしてから読み書きするので、
     両プレイヤーからのリクエストがほぼ同時に来ても、通信の遅延・
     リトライ・順序の入れ替わりに関係なく、DBに書き込まれた値だけを
@@ -506,18 +670,18 @@ def match_result():
     session_id = data.get('session_id')
     username = data.get('username')
     points = data.get('points')
-
+ 
     if not session_id or not username or points is None:
         return jsonify({"error": "session_id, username and points are required"}), 400
-
+ 
     if not is_valid_points(points):
         return jsonify({"error": "points must be a number"}), 400
-
+ 
     conn = None
     try:
         conn = get_db_connection()
         cur = conn.cursor()
-
+ 
         # 対象セッション行をロックして取得(他のリクエストはここで待たされる)
         cur.execute(
             "SELECT session_id, player1_name, player2_name, "
@@ -527,17 +691,17 @@ def match_result():
             (session_id,)
         )
         row = dictfetchone(cur)
-
+ 
         if not row:
             conn.rollback()
             return jsonify({"error": "Session not found"}), 404
-
+ 
         if username not in (row["player1_name"], row["player2_name"]):
             conn.rollback()
             return jsonify({"error": "username does not belong to this session"}), 400
-
+ 
         is_player1 = username == row["player1_name"]
-
+ 
         # 相手(または自分)がすでに辞退している場合
         if row["status"] == 'cancelled':
             opponent = row["player2_name"] if is_player1 else row["player1_name"]
@@ -547,7 +711,7 @@ def match_result():
                 "status": "opponent_declined",
                 "opponent": opponent,
             }), 200
-
+ 
         # まだ勝敗が確定していなければ、自分のスコアをDBに記録する
         if row["status"] == 'pending':
             if is_player1:
@@ -562,17 +726,17 @@ def match_result():
                     (points, session_id)
                 )
                 row["player2_points"] = points
-
+ 
             both_done = (
                 row["player1_points"] is not None
                 and row["player2_points"] is not None
             )
-
+ 
             if not both_done:
                 conn.commit()
                 cur.close()
                 return jsonify({"status": "waiting_for_opponent"}), 200
-
+ 
             # 両者そろったので、DBに記録された値だけを見て勝敗を確定させる
             p1_pts, p2_pts = row["player1_points"], row["player2_points"]
             if p1_pts > p2_pts:
@@ -581,7 +745,7 @@ def match_result():
                 winner = row["player2_name"]
             else:
                 winner = "引き分け"
-
+ 
             cur.execute(
                 "UPDATE match_sessions SET status = 'finished', winner = %s "
                 "WHERE session_id = %s",
@@ -589,7 +753,7 @@ def match_result():
             )
             row["status"] = "finished"
             row["winner"] = winner
-
+ 
             # ランキング表示用のmatchesテーブルにも保存
             cur.execute(
                 "INSERT INTO matches "
@@ -597,24 +761,29 @@ def match_result():
                 "VALUES (%s, %s, %s, %s, %s)",
                 (row["player1_name"], p1_pts, row["player2_name"], p2_pts, winner)
             )
-
+ 
+            # 勝者にポイントを加算する(引き分けの場合は加算しない)
+            if winner != "引き分け":
+                winner_points = p1_pts if winner == row["player1_name"] else p2_pts
+                award_points(cur, winner, winner_points)
+ 
         # ここに来る時点で status = 'finished' (今回確定/既に確定済みの両方を含む)
         delivered_col = "player1_delivered" if is_player1 else "player2_delivered"
         cur.execute(
             f"UPDATE match_sessions SET {delivered_col} = TRUE WHERE session_id = %s",
             (session_id,)
         )
-
+ 
         conn.commit()
         cur.close()
-
+ 
         return jsonify({
             "status": "finished",
             "winner": row["winner"],
             "player1_name": row["player1_name"], "player1_points": row["player1_points"],
             "player2_name": row["player2_name"], "player2_points": row["player2_points"],
         }), 200
-
+ 
     except Exception as e:
         if conn:
             conn.rollback()
@@ -623,11 +792,10 @@ def match_result():
     finally:
         if conn:
             conn.close()
-
-
+ 
+ 
 if __name__ == '__main__':
     init_db()
     port = int(os.environ.get("PORT", 5000))
     debug = os.environ.get("FLASK_DEBUG") == "1" or os.environ.get("FLASK_ENV") == "development"
     app.run(host='0.0.0.0', port=port, debug=debug)
- 
