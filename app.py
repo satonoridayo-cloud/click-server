@@ -1,6 +1,4 @@
 import os
-import threading
-import time
 import uuid
 import ssl
 from urllib.parse import urlparse
@@ -127,6 +125,26 @@ def init_db():
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             );
         """),
+        # ============================================================
+        # waiting_players: マッチング待機列そのものをDBの行で管理する。
+        # 以前はPythonプロセスのメモリ上のリスト(waiting_queue)で
+        # 管理していたが、Gunicornのワーカーを複数にすると
+        # ワーカーごとにメモリが別れて機能しなくなる問題があった。
+        # 1人が参加ボタンを押すごとに1行追加され(使い捨てのid=idカラム)、
+        # id昇順で「一番古い、まだ誰ともマッチしていない他人」を
+        # 隣同士としてペアにする。ペアが決まったら両者の行に
+        # session_id(match_sessionsの使い捨てID)を書き込み、
+        # 本人が受け取り次第その行は削除する。
+        # ============================================================
+        ("waiting_players", """
+            CREATE TABLE IF NOT EXISTS waiting_players (
+                id SERIAL PRIMARY KEY,
+                username VARCHAR(100) NOT NULL,
+                session_id UUID,
+                opponent_name VARCHAR(100),
+                joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+        """),
     ]
 
     for table_name, ddl in table_statements:
@@ -151,40 +169,15 @@ init_db()
 
 
 # ============================================================
-# マッチング待機列 (インメモリ)
+# マッチング待機列
 #
-# ここに残っているのは「まだ相手が決まっていない人同士を組み合わせる」
-# だけの一時的な処理。組み合わせが決まった後の点数記録・勝敗判定は
-# すべて match_sessions テーブル(DB側)で行う。
-#
-# 注意: 待機列自体は依然インメモリなので、Gunicornのワーカーを複数に
-# する場合はここだけは共有ストア(Redis等)への置き換えが必要。
+# 待機列そのものをDBの waiting_players テーブルの行で管理する
+# (詳細は init_db 内のコメントを参照)。これによりPythonプロセスの
+# メモリに何も持たないので、Gunicornのワーカーを複数にしても
+# 問題なく動作する。
 # ============================================================
 
-lock = threading.Lock()
-
-# 対戦待ちのプレイヤー: [{"username": str, "joined_at": float}]
-waiting_queue = []
-
-# マッチング成立後、まだ本人に通知(次のjoinポーリング)していないペア情報
-# username -> {"opponent": str, "session_id": str}
-pending_notifications = {}
-
-WAITING_QUEUE_TIMEOUT_SECONDS = 60 * 2  # 2分応答のない待機列エントリは掃除
-
-
-def cleanup_stale_waiting_queue():
-    """
-    ブラウザが正常終了できず(sendBeaconが届かない等)、待機列に
-    取り残されたままのプレイヤーを掃除する。
-    正常にポーリングを続けているプレイヤーは match_join のたびに
-    再追加され joined_at が更新されるので、ここで消しても実害はない。
-    """
-    now = time.time()
-    waiting_queue[:] = [
-        p for p in waiting_queue
-        if now - p["joined_at"] <= WAITING_QUEUE_TIMEOUT_SECONDS
-    ]
+WAITING_QUEUE_TIMEOUT_SECONDS = 60 * 2  # 2分応答のない待機行は掃除
 
 
 def is_valid_points(value):
@@ -332,79 +325,124 @@ def post_single_result():
 
 @app.route('/api/match/join', methods=['POST'])
 def match_join():
+    """
+    マッチング待機列そのものをDB(waiting_players)で管理する。
+
+    流れ:
+      1. 一定時間応答のない待機行(ゴースト)を掃除
+      2. 自分の待機行がすでにあり、session_idが埋まっていれば
+         =マッチ成立済みなので、それを返して行を削除(使い捨て)
+      3. 自分の待機行がなければ新規に1行追加
+      4. まだ誰ともマッチしていない一番古い他人の行を探し、
+         見つかれば新しい使い捨てID(session_id)を発行して
+         両者の行に書き込み、match_sessions側にも対戦を作成する
+      5. 見つからなければ「待機中」のまま返す
+    """
     data = request.get_json(silent=True) or {}
     username = data.get('username')
     if not username:
         return jsonify({"error": "username is required"}), 400
 
-    with lock:
-        cleanup_stale_waiting_queue()
+    conn = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
 
-        # 1. 自分宛にすでに成立した通知があれば渡す
-        if username in pending_notifications:
-            info = pending_notifications.pop(username)
-            return jsonify({
-                "status": "matched",
-                "opponent": info["opponent"],
-                "session_id": info["session_id"],
-            }), 200
-
-        # 2. 待機列に他の誰かがいればマッチさせる
-        candidate = next(
-            (p for p in waiting_queue if p["username"] != username), None
+        # 1. ゴースト掃除(ブラウザが正常終了できず残ったままの待機行)
+        cutoff = datetime.utcnow() - timedelta(seconds=WAITING_QUEUE_TIMEOUT_SECONDS)
+        cur.execute(
+            "DELETE FROM waiting_players WHERE session_id IS NULL AND joined_at < %s",
+            (cutoff,)
         )
-        if candidate:
-            waiting_queue.remove(candidate)
-            opponent = candidate["username"]
-            session_id = str(uuid.uuid4())
 
-            # 対戦セッションの本体はDBに作る(勝敗判定の正はDB)
-            conn = None
-            try:
-                conn = get_db_connection()
-                cur = conn.cursor()
-                cur.execute(
-                    "INSERT INTO match_sessions "
-                    "(session_id, player1_name, player2_name, status) "
-                    "VALUES (%s, %s, %s, 'pending')",
-                    (session_id, username, opponent)
-                )
-                conn.commit()
-                cur.close()
-            except Exception as e:
-                if conn:
-                    conn.rollback()
-                print(f"match_join: failed to create match_sessions row: {e}")
-                # DB作成に失敗した場合はマッチング自体を無かったことにし、
-                # 相手を待機列に戻す
-                waiting_queue.append(candidate)
-                return jsonify({"error": "matching failed, please retry"}), 500
-            finally:
-                if conn:
-                    conn.close()
+        # 2. 自分の待機行があるか確認(あれば行ロック)
+        cur.execute(
+            "SELECT id, session_id, opponent_name FROM waiting_players "
+            "WHERE username = %s ORDER BY id DESC LIMIT 1 FOR UPDATE",
+            (username,)
+        )
+        my_row = dictfetchone(cur)
 
-            # 相手側は次のポーリングで受け取れるようにしておく
-            pending_notifications[opponent] = {
-                "opponent": username,
-                "session_id": session_id,
-            }
+        if my_row and my_row["session_id"] is not None:
+            # すでにマッチ成立済み → 使い捨てなのでこの行は削除して結果を返す
+            session_id = my_row["session_id"]
+            opponent = my_row["opponent_name"]
+            cur.execute("DELETE FROM waiting_players WHERE id = %s", (my_row["id"],))
+            conn.commit()
+            cur.close()
             return jsonify({
                 "status": "matched",
                 "opponent": opponent,
-                "session_id": session_id,
+                "session_id": str(session_id),
             }), 200
 
-        # 3. 誰もいなければ自分を待機列に追加する
-        #    (既にいる場合は joined_at を更新して「生きている」ことを示す)
-        existing = next(
-            (p for p in waiting_queue if p["username"] == username), None
-        )
-        if existing:
-            existing["joined_at"] = time.time()
-        else:
-            waiting_queue.append({"username": username, "joined_at": time.time()})
+        if not my_row:
+            # 初回のjoin → 待機行を新規作成(使い捨てのid = このSERIAL id)
+            cur.execute(
+                "INSERT INTO waiting_players (username, session_id, opponent_name) "
+                "VALUES (%s, NULL, NULL) RETURNING id",
+                (username,)
+            )
+            my_row = dictfetchone(cur)
 
+        # 3. まだ誰ともマッチしていない一番古い他人の行を探す(=隣)
+        #    FOR UPDATE SKIP LOCKED: 同時に来た別のリクエストが
+        #    ロック中の行はスキップして競合を避ける
+        cur.execute(
+            "SELECT id, username FROM waiting_players "
+            "WHERE session_id IS NULL AND username != %s "
+            "ORDER BY id ASC LIMIT 1 FOR UPDATE SKIP LOCKED",
+            (username,)
+        )
+        opponent_row = dictfetchone(cur)
+
+        if opponent_row:
+            new_session_id = str(uuid.uuid4())
+
+            # 勝敗判定の正となるmatch_sessions側にも対戦を作成
+            cur.execute(
+                "INSERT INTO match_sessions "
+                "(session_id, player1_name, player2_name, status) "
+                "VALUES (%s, %s, %s, 'pending')",
+                (new_session_id, username, opponent_row["username"])
+            )
+
+            # 両者の待機行に使い捨てIDと相手の名前を書き込む(=隣と接続)
+            cur.execute(
+                "UPDATE waiting_players SET session_id = %s, opponent_name = %s "
+                "WHERE id = %s",
+                (new_session_id, opponent_row["username"], my_row["id"])
+            )
+            cur.execute(
+                "UPDATE waiting_players SET session_id = %s, opponent_name = %s "
+                "WHERE id = %s",
+                (new_session_id, username, opponent_row["id"])
+            )
+
+            # 自分の分はここで確定して返せるので、自分の待機行はもう不要
+            cur.execute("DELETE FROM waiting_players WHERE id = %s", (my_row["id"],))
+
+            conn.commit()
+            cur.close()
+            return jsonify({
+                "status": "matched",
+                "opponent": opponent_row["username"],
+                "session_id": new_session_id,
+            }), 200
+
+        # 4. 相手が見つからなければ引き続き待機(残った1人は次の人を待つ)
+        conn.commit()
+        cur.close()
         return jsonify({"status": "waiting"}), 200
+
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        print(f"match_join error: {e}")
+        return jsonify({"error": "matching failed, please retry"}), 500
+    finally:
+        if conn:
+            conn.close()
 
 
 @app.route('/api/match/cancel', methods=['POST'])
@@ -412,10 +450,11 @@ def match_cancel():
     """
     待機列からの離脱、または「対戦確認画面」で"やめる"を押した場合に呼ばれる。
 
-    session_id が渡された場合(=マッチング確定後の辞退)は、DB上の
-    match_sessions.status を 'cancelled' にする。これにより、もう片方の
-    プレイヤーが結果を送信した際に waiting_for_opponent のまま固まらず、
-    「相手が辞退した」という結果をすぐ受け取れるようにする。
+    - まだマッチしていない待機行(waiting_players)があれば削除する
+    - session_id が渡された場合(=マッチング確定後の辞退)は、
+      match_sessions.status を 'cancelled' にする。これにより、
+      もう片方のプレイヤーが結果を送信した際に waiting_for_opponent の
+      まま固まらず、「相手が辞退した」という結果をすぐ受け取れる。
     """
     data = request.get_json(silent=True) or {}
     username = data.get('username')
@@ -423,29 +462,32 @@ def match_cancel():
     if not username:
         return jsonify({"error": "username is required"}), 400
 
-    with lock:
-        waiting_queue[:] = [p for p in waiting_queue if p["username"] != username]
-        pending_notifications.pop(username, None)
+    conn = None
+    try:
+        conn = get_db_connection()
+        cur = conn.cursor()
 
-    if session_id:
-        conn = None
-        try:
-            conn = get_db_connection()
-            cur = conn.cursor()
+        cur.execute(
+            "DELETE FROM waiting_players WHERE username = %s AND session_id IS NULL",
+            (username,)
+        )
+
+        if session_id:
             cur.execute(
                 "UPDATE match_sessions SET status = 'cancelled', cancelled_by = %s "
                 "WHERE session_id = %s AND status = 'pending'",
                 (username, session_id)
             )
-            conn.commit()
-            cur.close()
-        except Exception as e:
-            if conn:
-                conn.rollback()
-            print(f"match_cancel: failed to update match_sessions: {e}")
-        finally:
-            if conn:
-                conn.close()
+
+        conn.commit()
+        cur.close()
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        print(f"match_cancel error: {e}")
+    finally:
+        if conn:
+            conn.close()
 
     return jsonify({"status": "cancelled"}), 200
 
@@ -588,3 +630,4 @@ if __name__ == '__main__':
     port = int(os.environ.get("PORT", 5000))
     debug = os.environ.get("FLASK_DEBUG") == "1" or os.environ.get("FLASK_ENV") == "development"
     app.run(host='0.0.0.0', port=port, debug=debug)
+ 
